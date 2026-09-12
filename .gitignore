@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+logs/*.log
+logs/last_run_summary.json
+*.egg-info/
+.DS_Store
