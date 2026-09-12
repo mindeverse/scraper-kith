@@ -286,7 +286,7 @@ def fetch_all_products_json() -> list[dict[str, Any]]:
         if not batch:
             break
         for raw in batch:
-            parsed = parse_product(raw, "all")
+            parsed = parse_shopify_product(raw, category="All", collection_handle="all")
             if parsed:
                 products.append(parsed)
         if len(batch) < limit:

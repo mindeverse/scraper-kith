@@ -15,7 +15,7 @@ class Config:
     LANDING_PAGE: str = "https://kith.com/"
     BASE_URL: str = "https://kith.com"
     CURRENCY: str = "USD"
-    PRODUCTS_JSON_LIMIT: int = 50
+    PRODUCTS_JSON_LIMIT: int = 250
 
     CATEGORY_URLS: list[str] = field(default_factory=lambda: [
         "https://kith.com/collections/kith",
