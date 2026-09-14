@@ -25,16 +25,37 @@ class SupabaseClient:
         self.client = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_KEY)
 
     def fetch_existing_products(self, source: str) -> dict[str, dict[str, Any]]:
+        """Load all existing products for source, paginated past PostgREST row cap.
+
+        Selects diff columns plus embedding vectors needed for smart-diff reuse.
+        PostgREST defaults to ~1000 rows; without pagination most of a ~5k catalog
+        looks "new" every run and re-embeds until the 6h Actions timeout.
+        """
         result: dict[str, dict[str, Any]] = {}
+        page_size = 1000
+        select_cols = (
+            "id,product_url,title,price,sale,category,description,"
+            "image_url,back_image_url,additional_images,size,tags,metadata,gender,"
+            "image_embedding,back_image_embedding,info_embedding"
+        )
         try:
-            response = (
-                self.client.table("products")
-                .select("*")
-                .eq("source", source)
-                .execute()
-            )
-            for row in response.data or []:
-                result[row["product_url"]] = row
+            start = 0
+            while True:
+                response = (
+                    self.client.table("products")
+                    .select(select_cols)
+                    .eq("source", source)
+                    .range(start, start + page_size - 1)
+                    .execute()
+                )
+                rows = response.data or []
+                if not rows:
+                    break
+                for row in rows:
+                    result[row["product_url"]] = row
+                if len(rows) < page_size:
+                    break
+                start += page_size
             logger.info("Fetched %d existing products from DB", len(result))
         except Exception as e:
             logger.error("Failed to fetch existing products: %s", e)
