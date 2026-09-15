@@ -51,10 +51,12 @@ class Config:
     EMBEDDING_MODEL: str = "google/siglip-base-patch16-384"
     EMBEDDING_DIM: int = 768
     EMBEDDING_VERSION: int = 2
-    RATE_LIMIT_DELAY: float = 1.0
-    BATCH_SIZE: int = 5
+    RATE_LIMIT_DELAY: float = 0.2
+    BATCH_SIZE: int = 50
     STALE_MISS_THRESHOLD: int = 2
     REQUEST_TIMEOUT: int = 30
+    SCRAPE_WORKERS: int = 8
+    TEXT_EMBED_BATCH_SIZE: int = 32
     USER_AGENT: str = (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"

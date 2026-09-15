@@ -5,11 +5,15 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 from urllib.parse import urljoin
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from config import cfg
 
@@ -17,14 +21,54 @@ logger = logging.getLogger(__name__)
 
 BACK_KEYWORDS = ("back", "rear", "_b.", "_back", "-back", "backview", "back_view")
 
+# Shared session with connection pooling and retry strategy
+_session: requests.Session | None = None
+_session_lock = threading.Lock()
+
+
+def _get_session() -> requests.Session:
+    global _session
+    if _session is None:
+        with _session_lock:
+            if _session is None:
+                _session = requests.Session()
+                retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+                adapter = HTTPAdapter(
+                    max_retries=retry,
+                    pool_connections=cfg.SCRAPE_WORKERS,
+                    pool_maxsize=cfg.SCRAPE_WORKERS,
+                )
+                _session.mount("https://", adapter)
+                _session.mount("http://", adapter)
+                _session.headers.update(_headers())
+    return _session
+
 
 def _headers() -> dict[str, str]:
     return {
         "User-Agent": cfg.USER_AGENT,
         "Accept": "application/json,text/html,*/*",
-        # Force EUR presentment on Shopify storefront JSON
         "Cookie": f"cart_currency={cfg.CURRENCY}; localization=EU",
     }
+
+
+# Semaphore to control concurrent requests to a single domain
+_request_semaphore = threading.Semaphore(cfg.SCRAPE_WORKERS)
+_last_request_time = 0.0
+_rate_lock = threading.Lock()
+
+
+def _rate_limited_get(url: str, timeout: int = 30) -> requests.Response:
+    """Get with per-domain rate limiting and connection pooling."""
+    global _last_request_time
+    with _request_semaphore:
+        with _rate_lock:
+            elapsed = time.monotonic() - _last_request_time
+            if elapsed < cfg.RATE_LIMIT_DELAY:
+                time.sleep(cfg.RATE_LIMIT_DELAY - elapsed)
+            _last_request_time = time.monotonic()
+        session = _get_session()
+        return session.get(url, timeout=timeout)
 
 
 def _stable_id(product_url: str) -> str:
@@ -115,9 +159,8 @@ def fetch_collection_products(category_url: str) -> list[dict[str, Any]]:
             f"{cfg.BASE_URL}/collections/{handle}/products.json"
             f"?limit={limit}&page={page}&currency={cfg.CURRENCY}"
         )
-        time.sleep(cfg.RATE_LIMIT_DELAY)
         try:
-            resp = requests.get(url, headers=_headers(), timeout=cfg.REQUEST_TIMEOUT)
+            resp = _rate_limited_get(url, timeout=cfg.REQUEST_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -275,9 +318,8 @@ def fetch_all_products_json() -> list[dict[str, Any]]:
     page = 1
     while True:
         url = f"{cfg.BASE_URL}/products.json?limit={limit}&page={page}"
-        time.sleep(cfg.RATE_LIMIT_DELAY)
         try:
-            resp = requests.get(url, headers=_headers(), timeout=cfg.REQUEST_TIMEOUT)
+            resp = _rate_limited_get(url, timeout=cfg.REQUEST_TIMEOUT)
             resp.raise_for_status()
             batch = (resp.json() or {}).get("products") or []
         except Exception as e:
@@ -299,25 +341,50 @@ def fetch_all_products_json() -> list[dict[str, Any]]:
 def scrape_all_categories() -> list[dict[str, Any]]:
     all_products: list[dict[str, Any]] = []
     seen: set[str] = set()
-    # Prefer full catalog crawl first for coverage
-    for p in fetch_all_products_json():
-        seen.add(p["product_url"])
-        all_products.append(p)
-    for url in cfg.CATEGORY_URLS:
-        handle = _category_handle(url)
-        for p in fetch_collection_products(url):
-            if p["product_url"] in seen:
-                # Merge duplicates; prefer explicit category/leaf data
-                existing = next(x for x in all_products if x["product_url"] == p["product_url"])
-                cats = {c.strip() for c in (existing.get("category") or "").split(",") if c.strip()}
-                if p.get("category"):
-                    cats.add(p["category"])
-                existing["category"] = ", ".join(sorted(cats)) if cats else existing.get("category")
-                # Prefer explicit gender from leaf collections
-                if p.get("gender") and not existing.get("gender"):
-                    existing["gender"] = p["gender"]
-                continue
+
+    # Run full catalog crawl and ALL category crawls in parallel
+    tasks: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=cfg.SCRAPE_WORKERS + 1) as executor:
+        # Submit full catalog crawl
+        future_catalog = executor.submit(fetch_all_products_json)
+        tasks["__catalog__"] = future_catalog
+
+        # Submit all category crawls in parallel
+        for url in cfg.CATEGORY_URLS:
+            handle = _category_handle(url)
+            tasks[handle] = executor.submit(fetch_collection_products, url)
+
+        # Collect full catalog results first
+        catalog_products = future_catalog.result()
+        for p in catalog_products:
             seen.add(p["product_url"])
             all_products.append(p)
+
+        # Collect category results
+        for url in cfg.CATEGORY_URLS:
+            handle = _category_handle(url)
+            future = tasks[handle]
+            try:
+                cat_products = future.result()
+            except Exception as e:
+                logger.error("Category %s crawl failed: %s", handle, e)
+                continue
+            for p in cat_products:
+                if p["product_url"] in seen:
+                    existing = next(
+                        (x for x in all_products if x["product_url"] == p["product_url"]),
+                        None,
+                    )
+                    if existing:
+                        cats = {c.strip() for c in (existing.get("category") or "").split(",") if c.strip()}
+                        if p.get("category"):
+                            cats.add(p["category"])
+                        existing["category"] = ", ".join(sorted(cats)) if cats else existing.get("category")
+                        if p.get("gender") and not existing.get("gender"):
+                            existing["gender"] = p["gender"]
+                    continue
+                seen.add(p["product_url"])
+                all_products.append(p)
+
     logger.info("Total unique products: %d", len(all_products))
     return all_products

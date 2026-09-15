@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -91,13 +92,18 @@ def run() -> dict[str, Any]:
         logger.error("SUPABASE_URL / SUPABASE_KEY missing")
         sys.exit(1)
 
-    scraped = scrape_all_categories()
+    supa = SupabaseClient()
+
+    # Run scraping and Supabase fetch in parallel — they are independent
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_scrape = executor.submit(scrape_all_categories)
+        future_existing = executor.submit(supa.fetch_existing_products, cfg.SOURCE)
+        scraped = future_scrape.result()
+        existing = future_existing.result()
+
     if not scraped:
         logger.error("No products scraped")
         return {"new": 0, "updated": 0, "unchanged": 0}
-
-    supa = SupabaseClient()
-    existing = supa.fetch_existing_products(cfg.SOURCE)
 
     to_embed: list[dict[str, Any]] = []
     unchanged = 0

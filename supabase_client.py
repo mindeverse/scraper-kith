@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,8 @@ logger = logging.getLogger(__name__)
 STALE_TRACKER_FILE = Path("logs") / "stale_tracker.json"
 FAILED_PRODUCTS_LOG = Path("logs") / "failed_products.log"
 
+UPSERT_WORKERS = 4
+
 
 class SupabaseClient:
     def __init__(self):
@@ -25,12 +28,7 @@ class SupabaseClient:
         self.client = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_KEY)
 
     def fetch_existing_products(self, source: str) -> dict[str, dict[str, Any]]:
-        """Load all existing products for source, paginated past PostgREST row cap.
-
-        Selects diff columns plus embedding vectors needed for smart-diff reuse.
-        PostgREST defaults to ~1000 rows; without pagination most of a ~5k catalog
-        looks "new" every run and re-embeds until the 6h Actions timeout.
-        """
+        """Load all existing products for source, paginated past PostgREST row cap."""
         result: dict[str, dict[str, Any]] = {}
         page_size = 1000
         select_cols = (
@@ -61,29 +59,26 @@ class SupabaseClient:
             logger.error("Failed to fetch existing products: %s", e)
         return result
 
-    def upsert_products(self, products: list[dict[str, Any]], batch_size: int = 5) -> tuple[int, int]:
-        total = len(products)
-        batches = [products[i : i + batch_size] for i in range(0, total, batch_size)]
+    def _upsert_single_batch(self, batch: list[dict[str, Any]], batch_idx: int) -> tuple[int, int]:
+        """Upsert a single batch with retries."""
         ok = 0
         fail = 0
-        for i, batch in enumerate(batches):
-            logger.info("Upserting batch %d/%d (%d products)", i + 1, len(batches), len(batch))
-            batch_ok = False
-            for attempt in range(3):
-                try:
-                    self.client.table("products").upsert(
-                        batch, on_conflict="source,product_url"
-                    ).execute()
-                    ok += len(batch)
-                    batch_ok = True
-                    break
-                except Exception as e:
-                    logger.warning("Batch upsert attempt %d/3 failed: %s", attempt + 1, e)
-                    time.sleep(2 ** (attempt + 1))
-            if batch_ok:
-                continue
-            # Fall back to single-row upserts (avoids statement timeout on vector batches)
-            logger.warning("Falling back to single-row upsert for batch %d", i + 1)
+        batch_ok = False
+        for attempt in range(3):
+            try:
+                self.client.table("products").upsert(
+                    batch, on_conflict="source,product_url"
+                ).execute()
+                ok += len(batch)
+                batch_ok = True
+                break
+            except Exception as e:
+                logger.warning("Batch %d attempt %d/3 failed: %s", batch_idx + 1, attempt + 1, e)
+                time.sleep(2 ** (attempt + 1))
+
+        if not batch_ok:
+            # Fall back to single-row upserts
+            logger.warning("Falling back to single-row upsert for batch %d", batch_idx + 1)
             for row in batch:
                 row_ok = False
                 for attempt in range(3):
@@ -100,6 +95,40 @@ class SupabaseClient:
                 if not row_ok:
                     fail += 1
                     self._log_failed_products([row])
+        return ok, fail
+
+    def upsert_products(self, products: list[dict[str, Any]], batch_size: int = 50) -> tuple[int, int]:
+        total = len(products)
+        batches = [products[i : i + batch_size] for i in range(0, total, batch_size)]
+        ok = 0
+        fail = 0
+
+        if len(batches) <= UPSERT_WORKERS:
+            # Few batches — run sequentially to avoid connection issues
+            for i, batch in enumerate(batches):
+                logger.info("Upserting batch %d/%d (%d products)", i + 1, len(batches), len(batch))
+                b_ok, b_fail = self._upsert_single_batch(batch, i)
+                ok += b_ok
+                fail += b_fail
+        else:
+            # Many batches — parallel upserts for throughput
+            logger.info("Parallel upsert: %d batches with %d workers", len(batches), UPSERT_WORKERS)
+            with ThreadPoolExecutor(max_workers=UPSERT_WORKERS) as executor:
+                futures = {
+                    executor.submit(self._upsert_single_batch, batch, i): i
+                    for i, batch in enumerate(batches)
+                }
+                for future in as_completed(futures):
+                    i = futures[future]
+                    try:
+                        b_ok, b_fail = future.result()
+                        ok += b_ok
+                        fail += b_fail
+                        logger.info("  Batch %d/%d done (ok=%d, fail=%d)", i + 1, len(batches), b_ok, b_fail)
+                    except Exception as e:
+                        logger.error("Batch %d raised exception: %s", i + 1, e)
+                        fail += len(batches[i])
+
         return ok, fail
 
     def delete_product(self, product_id: str) -> None:

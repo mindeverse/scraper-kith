@@ -153,6 +153,52 @@ def get_text_embedding(text: str) -> Optional[list[float]]:
         return None
 
 
+def get_text_embeddings_batch(texts: list[str], batch_size: int = 32) -> list[Optional[list[float]]]:
+    """Embed multiple texts in batches for much faster throughput."""
+    if not texts:
+        return []
+    model, _, tokenizer = _load_model()
+    device = _get_device()
+    all_results: list[Optional[list[float]]] = [None] * len(texts)
+
+    valid_indices = [i for i, t in enumerate(texts) if t and str(t).strip()]
+    if not valid_indices:
+        return all_results
+
+    for batch_start in range(0, len(valid_indices), batch_size):
+        batch_indices = valid_indices[batch_start: batch_start + batch_size]
+        batch_texts = [str(texts[i]).strip() for i in batch_indices]
+
+        try:
+            inputs = tokenizer(
+                text=batch_texts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=64,
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.inference_mode():
+                outputs = model.get_text_features(**inputs)
+            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                emb_tensor = outputs.pooler_output
+            elif hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+                emb_tensor = outputs.last_hidden_state[:, 0, :]
+            else:
+                emb_tensor = outputs
+            for j, idx in enumerate(batch_indices):
+                all_results[idx] = emb_tensor[j].cpu().float().numpy().flatten().tolist()
+        except Exception as e:
+            logger.warning("Batch text embed failed (size %d): %s", len(batch_texts), e)
+            for idx in batch_indices:
+                try:
+                    all_results[idx] = get_text_embedding(texts[idx])
+                except Exception:
+                    pass
+
+    return all_results
+
+
 def _build_info_text(product: dict[str, Any]) -> str:
     parts = []
     parts.append(f"Brand: {product.get('brand', 'Vwoollo')}")
@@ -472,11 +518,14 @@ def embed_products(
 
         download_executor.shutdown(wait=False)
 
-    # Text embeddings
+    # Text embeddings — batched for throughput
     checkpoint_data = load_checkpoint(source)
     _checkpoint_data = checkpoint_data
 
     logger.info("  Generating text embeddings for %d products...", len(products))
+
+    # First pass: build info texts and identify which need new embeddings
+    product_texts: list[tuple[int, str, str, dict[str, Any]]] = []
     for i, product in enumerate(products):
         product_url = product.get("product_url", "")
         existing = existing_embeddings.get(product_url, {})
@@ -499,20 +548,29 @@ def embed_products(
             existing_info_text = _build_info_text(existing)
 
         if not existing or info_text != existing_info_text:
-            text_emb = get_text_embedding(info_text)
+            product_texts.append((i, product_url, info_text, existing))
+        else:
+            if existing and existing.get("info_embedding"):
+                product["info_embedding"] = existing["info_embedding"]
+
+    if product_texts:
+        # Batch embed all texts at once
+        batch_texts = [t for _, _, t, _ in product_texts]
+        batch_embeddings = get_text_embeddings_batch(batch_texts, batch_size=cfg.TEXT_EMBED_BATCH_SIZE)
+
+        for (i, product_url, _, existing), text_emb in zip(product_texts, batch_embeddings):
+            product = products[i]
             if text_emb:
                 product["info_embedding"] = text_emb
                 stats["text_embeddings"] += 1
                 if product_url not in checkpoint_data:
                     checkpoint_data[product_url] = {}
                 checkpoint_data[product_url]["info_embedding"] = text_emb
-        else:
-            if existing and existing.get("info_embedding"):
-                product["info_embedding"] = existing["info_embedding"]
 
-        if (i + 1) % 500 == 0:
-            logger.info("  Text embedding progress: %d/%d", i + 1, len(products))
-            _save_checkpoint(source, checkpoint_data)
+        _save_checkpoint(source, checkpoint_data)
+        logger.info("  Text embedding complete: %d/%d embedded", stats["text_embeddings"], len(product_texts))
+    else:
+        logger.info("  All text embeddings up to date, skipping")
 
     _save_checkpoint(source, checkpoint_data)
     _checkpoint_data.clear()
