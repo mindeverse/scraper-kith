@@ -56,6 +56,7 @@ class Config:
     STALE_MISS_THRESHOLD: int = 2
     REQUEST_TIMEOUT: int = 30
     SCRAPE_WORKERS: int = 8
+    DOWNLOAD_WORKERS: int = 30
     TEXT_EMBED_BATCH_SIZE: int = 32
     USER_AGENT: str = (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

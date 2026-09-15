@@ -21,13 +21,14 @@ except ImportError:
     from transformers import SiglipImageProcessor
 from transformers import SiglipModel, SiglipTokenizer
 
+from config import cfg
+
 logger = logging.getLogger(__name__)
 
 logging.getLogger("transformers.configuration_utils").setLevel(logging.ERROR)
 
 MODEL_NAME = "google/siglip-base-patch16-384"
 EMBEDDING_DIM = 768
-DOWNLOAD_WORKERS = 10
 INFERENCE_BATCH_SIZE = 64
 CHECKPOINT_DIR = "logs"
 BATCH_DOWNLOAD = 200
@@ -56,10 +57,10 @@ def _load_model():
     if _model is None:
         num_cpus = os.cpu_count() or 2
         torch.set_num_threads(num_cpus)
-        logger.info("Loading SigLIP model %s (threads=%d)...", MODEL_NAME, num_cpus)
+        logger.info("Loading SigLIP model %s (threads=%d, dtype=bfloat16)...", MODEL_NAME, num_cpus)
         _image_processor = SiglipImageProcessor.from_pretrained(MODEL_NAME)
         _tokenizer = SiglipTokenizer.from_pretrained(MODEL_NAME)
-        _model = SiglipModel.from_pretrained(MODEL_NAME)
+        _model = SiglipModel.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
         _model.to(_get_device())
         _model.eval()
     return _model, _image_processor, _tokenizer
@@ -84,7 +85,7 @@ def _embed_images_batch(images: list[Image.Image]) -> list[Optional[list[float]]
     results: list[Optional[list[float]]] = [None] * len(images)
     try:
         inputs = image_processor(images=images, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = {k: v.to(device=device, dtype=model.dtype if v.is_floating_point() else v.dtype) for k, v in inputs.items()}
         with torch.inference_mode():
             outputs = model.get_image_features(**inputs)
         if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
@@ -110,7 +111,7 @@ def _embed_single(image: Image.Image) -> Optional[list[float]]:
     device = _get_device()
     try:
         inputs = image_processor(images=image, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = {k: v.to(device=device, dtype=model.dtype if v.is_floating_point() else v.dtype) for k, v in inputs.items()}
         with torch.inference_mode():
             outputs = model.get_image_features(**inputs)
         if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
@@ -138,7 +139,7 @@ def get_text_embedding(text: str) -> Optional[list[float]]:
             truncation=True,
             max_length=64,
         )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = {k: v.to(device=device, dtype=model.dtype if v.is_floating_point() else v.dtype) for k, v in inputs.items()}
         with torch.inference_mode():
             outputs = model.get_text_features(**inputs)
         if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
@@ -177,7 +178,7 @@ def get_text_embeddings_batch(texts: list[str], batch_size: int = 32) -> list[Op
                 truncation=True,
                 max_length=64,
             )
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+            inputs = {k: v.to(device=device, dtype=model.dtype if v.is_floating_point() else v.dtype) for k, v in inputs.items()}
             with torch.inference_mode():
                 outputs = model.get_text_features(**inputs)
             if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
@@ -228,7 +229,7 @@ def _download_batch(urls: list[str]) -> dict[str, Optional[Image.Image]]:
     results: dict[str, Optional[Image.Image]] = {}
     completed = 0
     total = len(urls)
-    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=cfg.DOWNLOAD_WORKERS) as executor:
         future_to_url = {executor.submit(_download_image, url): url for url in urls}
         for future in as_completed(future_to_url):
             url = future_to_url[future]
@@ -405,7 +406,7 @@ def embed_products(
             download_batches.append(all_needed[batch_start : batch_start + BATCH_DOWNLOAD])
 
         pending_download: dict[str, Optional[Image.Image]] = {}
-        download_executor = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
+        download_executor = ThreadPoolExecutor(max_workers=cfg.DOWNLOAD_WORKERS)
         next_download_future = None
 
         def _start_download(batch: list[tuple[int, str, str]]):
