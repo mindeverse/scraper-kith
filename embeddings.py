@@ -1,9 +1,10 @@
-"""Image and text embeddings using SigLIP (768-dim) - local model."""
+"""Image and text embeddings using SigLIP (768-dim) - local model with multiprocessing."""
 import gc
 import io
 import json
 import logging
 import math
+import multiprocessing as mp
 import os
 import pickle
 import queue
@@ -35,58 +36,82 @@ EMBEDDING_DIM = 768
 INFERENCE_BATCH_SIZE = 64
 CHECKPOINT_DIR = "logs"
 
-_model = None
-_image_processor = None
-_tokenizer = None
-_device = None
+
+# ── Worker process function ────────────────────────────────────────
+
+def _worker_embed(
+    worker_id: int,
+    input_queue: mp.Queue,
+    result_queue: mp.Queue,
+    num_workers: int,
+    shutdown_event: mp.Event,
+):
+    """Worker process: loads its own model, embeds images from queue."""
+    device = "cpu"
+    torch.set_num_threads(max(1, os.cpu_count() // num_workers))
+
+    logger.info("[Worker %d] Loading SigLIP model...", worker_id)
+    processor = SiglipImageProcessor.from_pretrained(MODEL_NAME)
+    model = SiglipModel.from_pretrained(MODEL_NAME)
+    model.to(device)
+    model.eval()
+    logger.info("[Worker %d] Model loaded.", worker_id)
+
+    while not shutdown_event.is_set():
+        try:
+            item = input_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        if item is None:  # Poison pill
+            break
+
+        idx, url, view_type, image_bytes = item
+
+        try:
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            inputs = processor(images=image, return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.inference_mode():
+                outputs = model.get_image_features(**inputs)
+            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                emb_tensor = outputs.pooler_output
+            elif hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+                emb_tensor = outputs.last_hidden_state[:, 0, :]
+            else:
+                emb_tensor = outputs
+            embedding = emb_tensor.cpu().float().numpy().flatten().tolist()
+            result_queue.put((idx, url, view_type, embedding, None))
+        except Exception as e:
+            result_queue.put((idx, url, view_type, None, str(e)))
+
+    logger.info("[Worker %d] Shutting down.", worker_id)
 
 
-def _get_device():
-    global _device
-    if _device is None:
-        _device = (
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu"
-        )
-    return _device
-
-
-def _load_model():
-    global _model, _image_processor, _tokenizer
-    if _model is None:
-        num_cpus = os.cpu_count() or 2
-        torch.set_num_threads(num_cpus)
-        logger.info("Loading SigLIP model %s (threads=%d)...", MODEL_NAME, num_cpus)
-        _image_processor = SiglipImageProcessor.from_pretrained(MODEL_NAME)
-        _tokenizer = SiglipTokenizer.from_pretrained(MODEL_NAME)
-        _model = SiglipModel.from_pretrained(MODEL_NAME)
-        _model.to(_get_device())
-        _model.eval()
-    return _model, _image_processor, _tokenizer
-
-
-def _download_image(image_url: str) -> Optional[Image.Image]:
+def _download_image_bytes(image_url: str) -> Optional[bytes]:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
     }
     try:
         resp = requests.get(image_url, timeout=15, headers=headers)
         resp.raise_for_status()
-        return Image.open(io.BytesIO(resp.content)).convert("RGB")
+        return resp.content
     except Exception as e:
         logger.warning("Failed to download image %s: %s", image_url, e)
         return None
 
 
 def _embed_images_batch(images: list[Image.Image]) -> list[Optional[list[float]]]:
-    model, image_processor, _ = _load_model()
-    device = _get_device()
+    """Fallback single-process batch embedding (for small batches / text)."""
+    processor = SiglipImageProcessor.from_pretrained(MODEL_NAME)
+    device = "cpu"
+    model = SiglipModel.from_pretrained(MODEL_NAME)
+    model.to(device)
+    model.eval()
+
     results: list[Optional[list[float]]] = [None] * len(images)
     try:
-        inputs = image_processor(images=images, return_tensors="pt")
+        inputs = processor(images=images, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.inference_mode():
             outputs = model.get_image_features(**inputs)
@@ -100,19 +125,18 @@ def _embed_images_batch(images: list[Image.Image]) -> list[Optional[list[float]]
             results[i] = emb_tensor[i].cpu().float().numpy().flatten().tolist()
     except Exception as e:
         logger.warning("Batch embed failed (size %d): %s", len(images), e)
-        for i, img in enumerate(images):
-            try:
-                results[i] = _embed_single(img)
-            except Exception:
-                pass
     return results
 
 
 def _embed_single(image: Image.Image) -> Optional[list[float]]:
-    model, image_processor, _ = _load_model()
-    device = _get_device()
+    """Fallback single-process single-image embedding."""
+    processor = SiglipImageProcessor.from_pretrained(MODEL_NAME)
+    device = "cpu"
+    model = SiglipModel.from_pretrained(MODEL_NAME)
+    model.to(device)
+    model.eval()
     try:
-        inputs = image_processor(images=image, return_tensors="pt")
+        inputs = processor(images=image, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.inference_mode():
             outputs = model.get_image_features(**inputs)
@@ -131,8 +155,12 @@ def _embed_single(image: Image.Image) -> Optional[list[float]]:
 def get_text_embedding(text: str) -> Optional[list[float]]:
     if not text or not str(text).strip():
         return None
-    model, _, tokenizer = _load_model()
-    device = _get_device()
+    processor = SiglipImageProcessor.from_pretrained(MODEL_NAME)
+    tokenizer = SiglipTokenizer.from_pretrained(MODEL_NAME)
+    device = "cpu"
+    model = SiglipModel.from_pretrained(MODEL_NAME)
+    model.to(device)
+    model.eval()
     try:
         inputs = tokenizer(
             text=[str(text).strip()],
@@ -160,8 +188,11 @@ def get_text_embeddings_batch(texts: list[str], batch_size: int = 32) -> list[Op
     """Embed multiple texts in batches for much faster throughput."""
     if not texts:
         return []
-    model, _, tokenizer = _load_model()
-    device = _get_device()
+    tokenizer = SiglipTokenizer.from_pretrained(MODEL_NAME)
+    device = "cpu"
+    model = SiglipModel.from_pretrained(MODEL_NAME)
+    model.to(device)
+    model.eval()
     all_results: list[Optional[list[float]]] = [None] * len(texts)
 
     valid_indices = [i for i, t in enumerate(texts) if t and str(t).strip()]
@@ -332,10 +363,10 @@ def embed_products(
         if url not in existing_embeddings:
             existing_embeddings[url] = ckpt_data
 
-    _load_model()
     _log_memory("after model load")
     _setup_signal_handlers(source)
 
+    # ── Determine which images need embedding ──────────────────────
     all_needed: list[tuple[int, str, str]] = []
     for i, product in enumerate(products):
         product_url = product.get("product_url", "")
@@ -362,6 +393,7 @@ def embed_products(
     logger.info("Need to embed %d images total", len(all_needed))
     _log_memory("before embedding loop")
 
+    # ── Restore existing embeddings from checkpoint ────────────────
     for i, product in enumerate(products):
         product_url = product.get("product_url", "")
         existing = existing_embeddings.get(product_url, {})
@@ -381,18 +413,34 @@ def embed_products(
     if not all_needed:
         logger.info("All images already embedded (from checkpoint/existing), skipping image embedding")
     else:
-        # ── Queue-based streaming pipeline ──────────────────────────
-        # Downloads happen in a thread pool. As each image arrives it is
-        # put on a queue.  The main thread pulls from the queue, batches
-        # up INFERENCE_BATCH_SIZE images and embeds them.  This way
-        # inference starts the moment the first 64 images are ready
-        # instead of waiting for all 200 to download.
-        _download_queue: queue.Queue = queue.Queue()
+        # ── Determine worker count ─────────────────────────────────
+        num_cpus = os.cpu_count() or 2
+        num_workers = min(num_cpus, cfg.DOWNLOAD_WORKERS, 8)
+        logger.info("  Using %d inference workers (%d CPUs available)", num_workers, num_cpus)
+
+        # ── Shared queues ──────────────────────────────────────────
+        input_queue: mp.Queue = mp.Queue(maxsize=500)
+        result_queue: mp.Queue = mp.Queue(maxsize=500)
+        shutdown_event = mp.Event()
+
+        # ── Start worker processes ─────────────────────────────────
+        workers = []
+        for w in range(num_workers):
+            p = mp.Process(
+                target=_worker_embed,
+                args=(w, input_queue, result_queue, num_workers, shutdown_event),
+                daemon=True,
+            )
+            p.start()
+            workers.append(p)
+        logger.info("  Started %d worker processes", num_workers)
+
+        # ── Download thread: fetch images, put bytes on input queue ─
         total_images = len(all_needed)
         downloaded_count = [0]
         download_done = threading.Event()
 
-        # Deduplicate URLs (one URL can appear as front+back for different products)
+        # Deduplicate URLs
         url_to_items: dict[str, list[tuple[int, str, str]]] = {}
         for item in all_needed:
             idx, url, view = item
@@ -404,147 +452,90 @@ def embed_products(
 
         def _download_worker():
             with ThreadPoolExecutor(max_workers=cfg.DOWNLOAD_WORKERS) as pool:
-                futures = {pool.submit(_download_image, url): url for url in unique_urls}
+                futures = {pool.submit(_download_image_bytes, url): url for url in unique_urls}
                 for fut in as_completed(futures):
                     url = futures[fut]
                     try:
-                        img = fut.result()
+                        img_bytes = fut.result()
                     except Exception:
-                        img = None
-                    _download_queue.put((url, img))
+                        img_bytes = None
+                    if img_bytes is not None:
+                        for idx, url_val, view_type in url_to_items[url]:
+                            try:
+                                input_queue.put((idx, url, view_type, img_bytes), timeout=5)
+                            except Exception:
+                                pass
                     downloaded_count[0] += 1
                     if downloaded_count[0] % 100 == 0:
                         logger.info("    Downloads: %d/%d", downloaded_count[0], len(unique_urls))
             download_done.set()
+            # Send poison pills
+            for _ in range(num_workers):
+                try:
+                    input_queue.put(None, timeout=5)
+                except Exception:
+                    pass
 
         dl_thread = threading.Thread(target=_download_worker, daemon=True)
         dl_thread.start()
 
-        # Main thread: consume from queue, batch, and embed
-        pending_by_url: dict[str, Optional[Image.Image]] = {}
-        pending_items: list[tuple[int, str, str]] = []
-        infer_buffer: list[tuple[int, str, str, Image.Image]] = []
-        batch_num = 0
+        # ── Main thread: collect results from workers ──────────────
         total_inferred = 0
         checkpoint_interval = 500
         last_checkpoint_count = 0
+        workers_alive = num_workers
+        failed_count = 0
 
-        while not (download_done.is_set() and _download_queue.empty()):
-            # Grab whatever is ready (non-blocking)
+        while workers_alive > 0:
             try:
-                while True:
-                    url, img = _download_queue.get_nowait()
-                    pending_by_url[url] = img
-                    for item in url_to_items[url]:
-                        pending_items.append(item)
+                result = result_queue.get(timeout=2.0)
             except queue.Empty:
-                pass
+                # Check if all workers are done
+                workers_alive = sum(1 for p in workers if p.is_alive())
+                continue
 
-            # Build inference buffer from ready items
-            still_pending: list[tuple[int, str, str]] = []
-            for item in pending_items:
-                idx, url, view = item
-                product = products[idx]
-                product_url = product.get("product_url", "")
-                existing = existing_embeddings.get(product_url, {})
+            if result is None:
+                workers_alive -= 1
+                continue
 
-                needs_embed = False
-                if view == "front":
-                    image_url = product.get("image_url", "")
-                    existing_image_url = existing.get("image_url", "")
-                    if image_url and (
-                        not existing
-                        or image_url != existing_image_url
-                        or not existing.get("image_embedding")
-                    ):
-                        needs_embed = True
-                elif view == "back":
-                    back_url = product.get("back_image_url")
-                    existing_back_url = existing.get("back_image_url")
-                    if back_url and (
-                        not existing
-                        or back_url != existing_back_url
-                        or not existing.get("back_image_embedding")
-                    ):
-                        needs_embed = True
-
-                if not needs_embed:
-                    continue
-
-                img = pending_by_url.get(url)
-                if img is not None:
-                    infer_buffer.append((idx, url, view, img))
-                elif img is None and url in pending_by_url:
-                    stats["skipped"] += 1
-                else:
-                    still_pending.append(item)
-
-            pending_items = still_pending
-
-            # Process full inference batches
-            while len(infer_buffer) >= INFERENCE_BATCH_SIZE:
-                batch_num += 1
-                batch = infer_buffer[:INFERENCE_BATCH_SIZE]
-                infer_buffer = infer_buffer[INFERENCE_BATCH_SIZE:]
-                _process_infer_batch(batch, products, existing_embeddings,
-                                     checkpoint_data, stats, source)
-                total_inferred += len(batch)
-
-                if total_inferred - last_checkpoint_count >= checkpoint_interval:
-                    _save_checkpoint(source, checkpoint_data)
-                    last_checkpoint_count = total_inferred
-                    logger.info("    Inferred %d/%d images (front=%d, back=%d)",
-                                total_inferred, total_images,
-                                stats["front_embeddings"], stats["back_embeddings"])
-
-            # Brief sleep to avoid busy-waiting
-            if not pending_items and not infer_buffer:
-                time.sleep(0.05)
-
-        # Process remaining items in pending
-        for item in pending_items:
-            idx, url, view = item
+            idx, url, view_type, embedding, error = result
             product = products[idx]
-            product_url = product.get("product_url", "")
-            existing = existing_embeddings.get(product_url, {})
+            purl = product.get("product_url", "")
 
-            needs_embed = False
-            if view == "front":
-                image_url = product.get("image_url", "")
-                existing_image_url = existing.get("image_url", "")
-                if image_url and (
-                    not existing
-                    or image_url != existing_image_url
-                    or not existing.get("image_embedding")
-                ):
-                    needs_embed = True
-            elif view == "back":
-                back_url = product.get("back_image_url")
-                existing_back_url = existing.get("back_image_url")
-                if back_url and (
-                    not existing
-                    or back_url != existing_back_url
-                    or not existing.get("back_image_embedding")
-                ):
-                    needs_embed = True
-
-            if needs_embed:
-                img = pending_by_url.get(url)
-                if img is not None:
-                    infer_buffer.append((idx, url, view, img))
+            if embedding is not None:
+                if view_type == "front":
+                    product["image_embedding"] = embedding
+                    stats["front_embeddings"] += 1
                 else:
-                    stats["skipped"] += 1
+                    product["back_image_embedding"] = embedding
+                    stats["back_embeddings"] += 1
+                if purl not in checkpoint_data:
+                    checkpoint_data[purl] = {}
+                if view_type == "front":
+                    checkpoint_data[purl]["image_embedding"] = embedding
+                    checkpoint_data[purl]["image_url"] = product.get("image_url", "")
+                else:
+                    checkpoint_data[purl]["back_image_embedding"] = embedding
+                    checkpoint_data[purl]["back_image_url"] = product.get("back_image_url", "")
+            else:
+                stats["skipped"] += 1
+                failed_count += 1
 
-        # Final inference batches
-        while infer_buffer:
-            batch_num += 1
-            batch = infer_buffer[:INFERENCE_BATCH_SIZE]
-            infer_buffer = infer_buffer[INFERENCE_BATCH_SIZE:]
-            _process_infer_batch(batch, products, existing_embeddings,
-                                 checkpoint_data, stats, source)
-            total_inferred += len(batch)
+            total_inferred += 1
 
-        dl_thread.join(timeout=5)
+            if total_inferred % 100 == 0:
+                logger.info("    Embedded %d/%d images (front=%d, back=%d, failed=%d)",
+                            total_inferred, total_images,
+                            stats["front_embeddings"], stats["back_embeddings"], failed_count)
+
+            if total_inferred - last_checkpoint_count >= checkpoint_interval:
+                _save_checkpoint(source, checkpoint_data)
+                last_checkpoint_count = total_inferred
+
+        # Wait for download thread
+        dl_thread.join(timeout=10)
+
+        # Final checkpoint
         _save_checkpoint(source, checkpoint_data)
         completed_urls.update(checkpoint_data.keys())
 
@@ -553,7 +544,7 @@ def embed_products(
             stats["front_embeddings"], stats["back_embeddings"], stats["skipped"],
         )
 
-    # Text embeddings — batched for throughput
+    # ── Text embeddings (single process, batched) ──────────────────
     checkpoint_data = load_checkpoint(source)
     _checkpoint_data = checkpoint_data
 
@@ -609,37 +600,3 @@ def embed_products(
     _checkpoint_data.clear()
 
     return products, stats
-
-
-def _process_infer_batch(
-    batch: list[tuple[int, str, str, Image.Image]],
-    products: list[dict[str, Any]],
-    existing_embeddings: dict[str, dict[str, Any]],
-    checkpoint_data: dict[str, dict[str, Any]],
-    stats: dict[str, int],
-    source: str,
-):
-    """Embed a batch of images and update products + checkpoint."""
-    pil_images = [img for _, _, _, img in batch]
-    embeddings = _embed_images_batch(pil_images)
-
-    for (idx, url, view_type, _), embedding in zip(batch, embeddings):
-        product = products[idx]
-        purl = product.get("product_url", "")
-        if embedding:
-            if view_type == "front":
-                product["image_embedding"] = embedding
-                stats["front_embeddings"] += 1
-            else:
-                product["back_image_embedding"] = embedding
-                stats["back_embeddings"] += 1
-            if purl not in checkpoint_data:
-                checkpoint_data[purl] = {}
-            if view_type == "front":
-                checkpoint_data[purl]["image_embedding"] = embedding
-                checkpoint_data[purl]["image_url"] = product.get("image_url", "")
-            else:
-                checkpoint_data[purl]["back_image_embedding"] = embedding
-                checkpoint_data[purl]["back_image_url"] = product.get("back_image_url", "")
-        else:
-            stats["skipped"] += 1
